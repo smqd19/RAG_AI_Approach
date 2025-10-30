@@ -1,168 +1,101 @@
-# 🧠 InsureLLM RAG Challenge: The LLM Context Compression Approach
+# InsureLLM RAG Challenge: The LLM Context Compression Approach
 
-This document outlines an advanced, experimental architecture for the **InsureLLM Challenge**, designed as a companion to the *Relevance-Prioritized Truncation* method.
+This document outlines the architecture of my high-performance **RAG (Retrieval-Augmented Generation)** pipeline, which was optimized through a systematic, data-driven process.
 
-The core philosophy of this pipeline is to solve two persistent challenges simultaneously:
-
-1. The strict **5,000-character context limit**.  
-2. The **"Completeness" failure** (3.55 / 5) observed even in high-recall retrieval systems.
-
-Instead of performing a "crude" truncation, this approach introduces a **second LLM call** as an intelligent *compression* step.  
-It instructs the LLM to synthesize only the most relevant information from the retrieved chunks — creating a single, dense context under the 5,000-character limit.
+The final architecture is a **Two-Stage Retrieval Pipeline** (using a Bi-Encoder and a Cross-Encoder) that is coupled with a **Relevance-Prioritized Truncation** strategy.  
+This strategy strictly enforces a **5,000-character context limit** using a **second LLM call** as an intelligent *compression* step. It instructs the LLM to synthesize only the most relevant information from the retrieved chunks, creating a single, dense context under the 5,000-character limit.
 
 ---
 
-## 📊 Data-Driven Diagnosis: Why This Was Needed
+## Data-Driven Diagnosis: Why This Architecture?
 
-Our iterative evaluation revealed how retrieval improvements were not enough on their own.
+My design directly evolved from the empirical results of multiple evaluation phases.
 
-1. **Baseline (Turn 13):** Naive RAG failed on complex queries.  
-   - **MRR:** 0.7228  
-   - **Completeness:** 3.56 / 5 (Red)
+### The Baseline Failure
 
-2. **Phase 1 (Turn 18):** Fixed indexing using `SemanticChunker`.[1, 2]  
-   - **Holistic accuracy improved**, but **MRR crashed** to 0.6667 → proving the retriever lacked precision.
+The initial "naive" RAG (using simple chunking and basic vector search) failed on complex queries.
 
-3. **Phase 2 (Turn 22):** Introduced **Two-Stage Retrieval (Bi-Encoder + Cross-Encoder)**  
-   - **MRR:** 0.6667 → 0.9058  
-   - **nDCG:** 0.6873 → 0.9049  
-   - Retrieval was nearly perfect — but **Completeness** remained low at 3.55 / 5.
+The baseline pipeline was:
+1. Fragmenting coherent information during indexing.  
+2. Failing to retrieve the right information for complex questions.
+---
 
-This indicated that even though we retrieved the right documents, the LLM’s context window and naive concatenation were *failing to synthesize complete answers*.
+### The Indexing Fix
+
+We replaced the `RecursiveCharacterTextSplitter` with `SemanticChunker`, which groups sentences based on meaning rather than character count.
+
+- **Partial Success:** "Holistic" Accuracy improved from 2.6 → 3.4 / 5  
+- **Critical New Failure:** **MRR dropped from 0.7228 → 0.6667**
+
+This proved that **better chunks hurt retrieval** when the retriever (bi-encoder) was too weak to rank nuanced semantic representations.
 
 ---
 
-## 🧠 The Solution: LLM-Based Context Compression
+### The Retrieval Solution
 
-This method solves both issues — the 5,000-character constraint and the completeness gap — through a **two-step LLM process**.
+To solve the 0.6667 MRR, we implemented a **Two-Stage Retrieval System**:
 
-### 🔁 Step 1: The Compression Call
+1. **Stage 1 – Bi-Encoder (Fast Recall):**  
+   Model: `all-MiniLM-L6-v2`  
+   Retrieves a large (k=50), high-recall candidate list.
+2. **Stage 2 – Cross-Encoder (High Precision):**  
+   Model: `BAAI/bge-reranker-base`  
+   Reranks candidates to select the top_n=3 most relevant documents.
+
+**Results:**
+- **MRR:** 0.6667 → **0.9058**
+- **nDCG:** 0.6873 → **0.9049**
+- **Answer Accuracy:** 3.81 → **4.42 / 5**
+
+This validated that our retriever now yields a *high-confidence* ranking of relevant documents.
+
+---
+
+## The 5,000-Character Constraint & Solution
+
+This method solves the 5,000-character constraint.
+
+### The Compression Call
 
 - Retrieve the top 3 documents using the cross-encoder re-ranker (`BAAI/bge-reranker-base`).
-- Pass all 3 to a **compression LLM** via a `COMPRESSION_PROMPT_TEMPLATE`.
+- Pass all 3 to a **compression LLM** via a `COMPRESSION_PROMPT`.
 - The LLM synthesizes a single dense, query-specific text block under 5,000 characters.
 
-### 💬 Step 2: The Generation Call
+### Step 2: The Generation Call
 
 - Feed the compressed text into the final `SYSTEM_PROMPT`.
 - The LLM then generates the final answer based only on the **distilled, relevance-aware** context.
 
 ---
 
-### ⚖️ Pros and Cons
+### `ingest.py`
 
-**✅ Pros:**
-- Smarter than truncation — synthesizes across multiple documents.  
-- Greatly improves “Completeness” by combining top-3 relevant chunks.  
-
-**⚠️ Cons:**
-- **Slower and costlier** (two LLM calls per query).  
-- **Risk of LLM hallucination** or over-compression if summarization fails.[3]
-
----
-
-## 🏗️ Final Code Architecture
-
-### `ingest.py` (Final Version)
-
-This component uses `SemanticChunker` to create coherent, semantically consistent chunks (same as in the truncation approach).
+The `RecursiveCharacterTextSplitter` was replaced with `SemanticChunker`.
 
 ```python
-import os
-import glob
-from pathlib import Path
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-# from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from dotenv import load_dotenv
-
-MODEL = "gpt-4.1-nano"
-
-DB_NAME = str(Path(__file__).parent.parent / "vector_db")
-KNOWLEDGE_BASE = str(Path(__file__).parent.parent / "knowledge-base")
 
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-load_dotenv(override=True)
-
-def fetch_documents():
-    folders = glob.glob(str(Path(KNOWLEDGE_BASE) / "*"))
-    documents = []
-    for folder in folders:
-        doc_type = os.path.basename(folder)
-        loader = DirectoryLoader(
-            folder, glob="**/*.md", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}
-        )
-        folder_docs = loader.load()
-        for doc in folder_docs:
-            doc.metadata["doc_type"] = doc_type
-        documents.extend(folder_docs)
-    return documents
 
 def create_chunks(documents):
     text_splitter = SemanticChunker(embeddings)
     chunks = text_splitter.split_documents(documents)
     return chunks
-
-def create_embeddings(chunks):
-    if os.path.exists(DB_NAME):
-        Chroma(persist_directory=DB_NAME, embedding_function=embeddings).delete_collection()
-    vectorstore = Chroma.from_documents(
-        documents=chunks, embedding=embeddings, persist_directory=DB_NAME
-    )
-    return vectorstore
-
-if __name__ == "__main__":
-    documents = fetch_documents()
-    chunks = create_chunks(documents)
-    create_embeddings(chunks)
-    print("Ingestion complete")
 ```
-
 ---
 
-### `answer.py` (Final Version – LLM Compression)
+### `answer.py`
 
-Implements **Two-Stage Retrieval** with **LLM Context Compression**.
+Implements the `Two-Stage Retriever` and `LLM Context Compression` logic.
 
 ```python
-from pathlib import Path
-from langchain_openai import ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
-from typing import List, Optional, Tuple
-
-# New imports for compression
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate 
-
-# Classic and community imports
 from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
-from dotenv import load_dotenv
-load_dotenv(override=True)
-
-MODEL = "gpt-4.1-nano"
-DB_NAME = str(Path(__file__).parent.parent / "vector_db")
-
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-MAX_CONTEXT_LENGTH = 5000
-
-SYSTEM_PROMPT = """
-You are a knowledgeable assistant representing InsureLLM.
-Use ONLY the provided context to answer the user's question.
-If the context is insufficient, say you cannot answer based on the documents.
-
-Context:
-{context}
-"""
-
-# --- Compression Prompt Template ---
-COMPRESSION_PROMPT_TEMPLATE = """You are a highly intelligent text analysis assistant.
+# Compression Prompt
+COMPRESSION_PROMPT= """You are a highly intelligent text analysis assistant.
 You will be given a user's query and several context chunks retrieved by a search system.
 Analyze them and extract ONLY the information relevant to answering the query.
 
@@ -198,13 +131,6 @@ def fetch_context(question: str) -> list:
     return docs
 
 def answer_question(question: str, history: Optional[List] = None) -> Tuple[str, List]:
-    if history is None:
-        history = []
-
-    # Step 1: Retrieve
-    docs = fetch_context(question)
-    if not docs:
-        return "No relevant documents found.", []
 
     # Step 2: LLM Compression
     print(f"\n--- COMPRESSING CONTEXT ---")
@@ -228,39 +154,25 @@ def answer_question(question: str, history: Optional[List] = None) -> Tuple[str,
 
 ---
 
-## 🖼️ Visual Results
+## Results
 
 *(Add your result images below — replace these placeholders with actual paths once available.)*
 
-### 📈 Comparison of Compression vs. Truncation
+### Retrieval Evaluation
 
-![Compression Results Placeholder](images/compression_results.png)
+![Retrieval Evaluation](assests/1_AI.PNG)
 
-### 🧩 Context Compression Flow Diagram
+### Answer Evaluation
 
-![Compression Flow Placeholder](images/compression_flow.png)
+![Answer Evaluation](assests/2_AI.PNG)
 
 ---
 
-## 🧰 Installation
+## Installation
 
 Please install the required packages before running the pipeline:
 
 ```bash
+uv sync
 uv pip install langchain-experimental langchain-classic langchain-community
 ```
-
----
-
-## 📚 References
-
-1. LangChain Experimental – [SemanticChunker Documentation](https://python.langchain.com/docs/modules/data_connection/document_transformers/semantic_chunker)
-2. HuggingFace – [MiniLM Embeddings](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
-3. BAAI – [bge-reranker-base](https://huggingface.co/BAAI/bge-reranker-base)
-4. Microsoft Research – *Dual Encoder vs. Cross Encoder in Dense Retrieval*
-
----
-
-**Author:** Your Name  
-**Project:** InsureLLM RAG Challenge  
-**Result:** 🧩 Experimental “LLM Compression” pipeline — designed to improve *Completeness* while maintaining a 0.90+ MRR.
